@@ -1,243 +1,180 @@
 """
-Мониторинг наличия Когниттера 60 мг в аптеках Нижегородской области
-Использует Playwright для обхода защиты сайтов
+Мониторинг наличия Когниттера 60 мг
+Нижегородская область + соседние регионы
 """
 
 import asyncio
 import os
-import json
 import re
 from datetime import datetime
 from playwright.async_api import async_playwright
 import httpx
 
 # ─────────────────────────────────────────────
-# НАСТРОЙКИ — меняй только здесь
+# НАСТРОЙКИ
 # ─────────────────────────────────────────────
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-DRUG_NAME = "Когниттера"
-DRUG_DOSE = "60 мг"
-SEARCH_QUERY = "Когниттера 60"
+DRUG_NAME    = "Когниттера"
+DRUG_DOSE    = "60 мг"
 
-# Сайты для мониторинга (url, тип парсинга)
-SITES = [
+# ─────────────────────────────────────────────
+# РЕГИОНЫ И ГОРОДА
+# Каждый регион — отдельный поддомен Uteka.
+# Мелкие города (Муром, Арзамас и др.) входят
+# в региональный поддомен и проверяются автоматически.
+# ─────────────────────────────────────────────
+UTEKA_REGIONS = [
+    # ── Нижегородская область ─────────────────
+    {"label": "Нижний Новгород и НО",      "subdomain": "nn"},
+
+    # ── Соседние регионы (запрошены) ──────────
+    {"label": "Владимир и область",        "subdomain": "vladimir"},
+    {"label": "Казань и Татарстан",        "subdomain": "kazan"},
+    {"label": "Пенза и область",           "subdomain": "penza"},
+    {"label": "Саранск и Мордовия",        "subdomain": "saransk"},
+    {"label": "Чебоксары и Чувашия",       "subdomain": "cheboksary"},
+    {"label": "Йошкар-Ола и Марий Эл",    "subdomain": "yoshkar-ola"},
+    {"label": "Иваново и область",         "subdomain": "ivanovo"},
+    {"label": "Ярославль и область",       "subdomain": "yaroslavl"},
+    {"label": "Ульяновск и область",       "subdomain": "ulyanovsk"},
+
+    # ── Дополнительно — логичные соседи НН ───
+    {"label": "Киров и область",           "subdomain": "kirov"},
+    {"label": "Рязань и область",          "subdomain": "ryazan"},
+    {"label": "Кострома и область",        "subdomain": "kostroma"},
+    {"label": "Тверь и область",           "subdomain": "tver"},
+    {"label": "Саратов и область",         "subdomain": "saratov"},
+]
+# Примечание: Муром входит в vladimir.uteka.ru,
+# Арзамас, Шарья, Шалунья, Семёнов — в nn.uteka.ru
+
+# Дополнительные прямые сайты (федеральные, сами ищут по всем городам)
+EXTRA_SITES = [
     {
-        "name": "Uteka (агрегатор — 1600+ аптек НН и области)",
-        "url": "https://nn.uteka.ru/lekarstvennye-sredstva/nervnaya-sistema/kognittera/",
-        "type": "uteka",
+        "name": "Zdravcity (все регионы)",
+        "url":  "https://zdravcity.ru/g_kognittera/",
     },
     {
-        "name": "Zdravcity",
-        "url": "https://zdravcity.ru/g_kognittera/r_nnovgorod/",
-        "type": "zdravcity",
-    },
-    {
-        "name": "Apteka.ru",
-        "url": "https://www.apteka.ru/nnovgorod/search/?q=когниттера+60",
-        "type": "apteka_ru",
-    },
-    {
-        "name": "eApteka",
-        "url": "https://www.eapteka.ru/goods/search/?q=когниттера+60",
-        "type": "eapteka",
-    },
-    {
-        "name": "Rigla",
-        "url": "https://www.rigla.ru/search?query=когниттера+60",
-        "type": "rigla",
-    },
-    {
-        "name": "Planeta Zdorovya",
-        "url": "https://planetazdorovo.ru/search/?q=когниттера+60",
-        "type": "planetazdorovo",
-    },
-    {
-        "name": "Stolichki",
-        "url": "https://stolichki.ru/search?q=когниттера+60",
-        "type": "stolichki",
-    },
-    {
-        "name": "366.ru",
-        "url": "https://366.ru/search/?query=когниттера+60",
-        "type": "366ru",
+        "name": "eApteka (все регионы)",
+        "url":  "https://www.eapteka.ru/goods/search/?q=когниттера+60",
     },
 ]
 # ─────────────────────────────────────────────
 
 
 async def send_telegram(message: str):
-    """Отправить сообщение в Telegram"""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️  Telegram не настроен — вывожу в консоль:")
-        print(message)
+        print("⚠️  Telegram не настроен, вывод в консоль:\n", message)
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
+            "chat_id":    TELEGRAM_CHAT_ID,
+            "text":       message,
             "parse_mode": "HTML",
             "disable_web_page_preview": False,
         })
         if resp.status_code != 200:
-            print(f"❌ Ошибка Telegram: {resp.text}")
+            print(f"❌ Telegram ошибка: {resp.text}")
         else:
             print("✅ Telegram уведомление отправлено")
 
 
-def is_target_drug(text: str) -> bool:
-    """Проверяем что текст содержит нужный препарат с нужной дозировкой"""
-    text_lower = text.lower()
-    has_name = "когниттера" in text_lower
-    has_dose = "60" in text_lower
-    return has_name and has_dose
+def is_target(text: str) -> bool:
+    t = text.lower()
+    return "когниттера" in t and "60" in t
 
 
-async def check_uteka(page) -> list[dict]:
-    """Uteka — агрегатор, самый важный источник"""
+def extract_price(text: str) -> str:
+    m = re.search(r"(\d[\d\s]*)\s*₽", text)
+    return m.group(0).strip() if m else "—"
+
+
+def is_in_stock(text: str) -> bool:
+    t = text.lower()
+    out_phrases = [
+        "нет в наличии", "под заказ", "сообщить о наличии",
+        "нет на складе", "временно отсутствует", "нет в продаже",
+    ]
+    return not any(p in t for p in out_phrases)
+
+
+async def scrape_page(page, url: str, site_label: str) -> list[dict]:
+    """Универсальный парсер — пробует несколько стратегий."""
     results = []
     try:
-        await page.goto(
-            "https://nn.uteka.ru/lekarstvennye-sredstva/nervnaya-sistema/kognittera/",
-            wait_until="domcontentloaded",
-            timeout=30000,
-        )
+        await page.goto(url, wait_until="domcontentloaded", timeout=35000)
         await page.wait_for_timeout(3000)
 
-        # Ищем карточки товаров
-        items = await page.query_selector_all("[class*='product-card'], [class*='ProductCard'], article")
-        for item in items:
-            text = await item.inner_text()
-            if is_target_drug(text):
-                # Проверяем наличие (отсутствие фразы "нет в наличии")
-                in_stock = not any(phrase in text.lower() for phrase in [
-                    "нет в наличии", "под заказ", "сообщить о наличии", "нет на складе"
-                ])
-                # Ищем цену
-                price_match = re.search(r"(\d[\d\s]*)\s*₽", text)
-                price = price_match.group(0) if price_match else "цена неизвестна"
-                # Ссылка
-                link_el = await item.query_selector("a")
-                href = await link_el.get_attribute("href") if link_el else ""
-                if href and not href.startswith("http"):
-                    href = "https://nn.uteka.ru" + href
-
-                results.append({
-                    "site": "Uteka (НН и область)",
-                    "name": text.split("\n")[0][:80],
-                    "price": price,
-                    "in_stock": in_stock,
-                    "url": href or "https://nn.uteka.ru/lekarstvennye-sredstva/nervnaya-sistema/kognittera/",
-                })
-
-        # Если не нашли через карточки — fallback через текст страницы
-        if not results:
-            body = await page.inner_text("body")
-            if is_target_drug(body):
-                in_stock = not any(p in body.lower() for p in ["нет в наличии", "сообщить о наличии"])
-                price_match = re.search(r"(\d[\d\s]+)\s*₽", body)
-                results.append({
-                    "site": "Uteka (НН и область)",
-                    "name": f"{DRUG_NAME} {DRUG_DOSE}",
-                    "price": price_match.group(0) if price_match else "—",
-                    "in_stock": in_stock,
-                    "url": "https://nn.uteka.ru/lekarstvennye-sredstva/nervnaya-sistema/kognittera/",
-                })
-    except Exception as e:
-        print(f"  ⚠️  Uteka: {e}")
-    return results
-
-
-async def check_generic_site(page, site: dict) -> list[dict]:
-    """Универсальный парсер для остальных сайтов"""
-    results = []
-    try:
-        await page.goto(site["url"], wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(3000)
-
-        # Пробуем несколько типовых селекторов для карточек товаров
-        selectors = [
-            "[class*='product-card']",
-            "[class*='ProductCard']",
-            "[class*='product_card']",
-            "[class*='catalog-item']",
-            "[class*='search-result']",
-            "article",
-            "[class*='good']",
-            "[class*='item']",
+        # Стратегия 1: карточки товаров
+        card_selectors = [
+            "[class*='product-card']", "[class*='ProductCard']",
+            "[class*='product_card']", "[class*='catalog-item']",
+            "[class*='search-result']", "[class*='good-card']",
+            "[class*='item-card']", "article",
         ]
-
-        found_items = []
-        for sel in selectors:
+        cards = []
+        for sel in card_selectors:
             items = await page.query_selector_all(sel)
-            if len(items) > 0:
-                found_items = items
+            if items:
+                cards = items
                 break
 
-        for item in found_items[:20]:  # не больше 20 результатов
+        for card in cards[:15]:
             try:
-                text = await item.inner_text()
-                if is_target_drug(text):
-                    in_stock = not any(phrase in text.lower() for phrase in [
-                        "нет в наличии", "под заказ", "сообщить о наличии",
-                        "нет на складе", "временно отсутствует",
-                    ])
-                    price_match = re.search(r"(\d[\d\s]*)\s*₽", text)
-                    link_el = await item.query_selector("a")
-                    href = await link_el.get_attribute("href") if link_el else ""
-                    domain = "/".join(site["url"].split("/")[:3])
-                    if href and not href.startswith("http"):
-                        href = domain + href
-
-                    results.append({
-                        "site": site["name"],
-                        "name": text.split("\n")[0][:80],
-                        "price": price_match.group(0) if price_match else "—",
-                        "in_stock": in_stock,
-                        "url": href or site["url"],
-                    })
+                text = await card.inner_text()
+                if not is_target(text):
+                    continue
+                link_el = await card.query_selector("a")
+                href = (await link_el.get_attribute("href") if link_el else "") or ""
+                if href and not href.startswith("http"):
+                    domain = "/".join(url.split("/")[:3])
+                    href = domain + href
+                results.append({
+                    "site":     site_label,
+                    "name":     text.split("\n")[0][:80].strip(),
+                    "price":    extract_price(text),
+                    "in_stock": is_in_stock(text),
+                    "url":      href or url,
+                })
             except Exception:
                 continue
 
-        # Fallback — анализ всего текста страницы
+        # Стратегия 2: полный текст страницы (fallback)
         if not results:
             body = await page.inner_text("body")
-            if is_target_drug(body):
-                in_stock = not any(p in body.lower() for p in [
-                    "нет в наличии", "сообщить о наличии", "временно отсутствует"
-                ])
-                price_match = re.search(r"(\d[\d\s]+)\s*₽", body)
+            if is_target(body):
                 results.append({
-                    "site": site["name"],
-                    "name": f"{DRUG_NAME} {DRUG_DOSE}",
-                    "price": price_match.group(0) if price_match else "—",
-                    "in_stock": in_stock,
-                    "url": site["url"],
+                    "site":     site_label,
+                    "name":     f"{DRUG_NAME} {DRUG_DOSE}",
+                    "price":    extract_price(body),
+                    "in_stock": is_in_stock(body),
+                    "url":      url,
                 })
 
     except Exception as e:
-        print(f"  ⚠️  {site['name']}: {e}")
+        print(f"  ⚠️  {site_label}: {e}")
+
     return results
 
 
 async def run_monitor():
-    print(f"\n{'='*55}")
+    now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
+    print(f"\n{'='*60}")
     print(f"  Мониторинг: {DRUG_NAME} {DRUG_DOSE}")
-    print(f"  Время: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
-    print(f"{'='*55}\n")
+    print(f"  Время: {now_str}")
+    print(f"  Регионов для проверки: {len(UTEKA_REGIONS)}")
+    print(f"{'='*60}\n")
 
-    all_results = []
+    all_results: list[dict] = []
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-blink-features=AutomationControlled",
-            ],
+            args=["--no-sandbox", "--disable-setuid-sandbox",
+                  "--disable-blink-features=AutomationControlled"],
         )
         context = await browser.new_context(
             user_agent=(
@@ -249,56 +186,71 @@ async def run_monitor():
             viewport={"width": 1280, "height": 800},
         )
 
-        for site in SITES:
-            print(f"🔍 Проверяю: {site['name']}")
-            page = await context.new_page()
-
-            if site["type"] == "uteka":
-                results = await check_uteka(page)
-            else:
-                results = await check_generic_site(page, site)
-
+        # ── Uteka по регионам ─────────────────────────────────
+        for region in UTEKA_REGIONS:
+            sub   = region["subdomain"]
+            label = region["label"]
+            url   = f"https://{sub}.uteka.ru/lekarstvennye-sredstva/nervnaya-sistema/kognittera/"
+            print(f"🔍 {label}")
+            page  = await context.new_page()
+            res   = await scrape_page(page, url, label)
             await page.close()
 
-            for r in results:
-                status = "✅ ЕСТЬ" if r["in_stock"] else "❌ нет"
-                print(f"   {status} | {r['name'][:50]} | {r['price']}")
+            for r in res:
+                icon = "✅" if r["in_stock"] else "❌"
+                print(f"   {icon} {r['name'][:55]} | {r['price']}")
+            if not res:
+                print("   — не найдено")
 
-            all_results.extend(results)
-            await asyncio.sleep(2)  # пауза между сайтами
+            all_results.extend(res)
+            await asyncio.sleep(1.5)
+
+        # ── Дополнительные федеральные сайты ─────────────────
+        for site in EXTRA_SITES:
+            print(f"🔍 {site['name']}")
+            page = await context.new_page()
+            res  = await scrape_page(page, site["url"], site["name"])
+            await page.close()
+
+            for r in res:
+                icon = "✅" if r["in_stock"] else "❌"
+                print(f"   {icon} {r['name'][:55]} | {r['price']}")
+            if not res:
+                print("   — не найдено")
+
+            all_results.extend(res)
+            await asyncio.sleep(1.5)
 
         await browser.close()
 
-    # ── Формируем отчёт ──────────────────────────────────────
-    in_stock = [r for r in all_results if r["in_stock"]]
+    # ── Формируем итоговый отчёт ──────────────────────────────
+    in_stock  = [r for r in all_results if r["in_stock"]]
     not_found = [r for r in all_results if not r["in_stock"]]
+    checked   = sorted(set(r["site"] for r in all_results))
 
-    now = datetime.now().strftime("%d.%m.%Y %H:%M")
+    print(f"\n{'='*60}")
+    print(f"  ✅ Найдено в наличии: {len(in_stock)}")
+    print(f"  ❌ Не в наличии:      {len(not_found)}")
+    print(f"  📍 Проверено источников: {len(checked)}")
+    print(f"{'='*60}\n")
 
     if in_stock:
-        msg = f"🟢 <b>НАЙДЕНО: {DRUG_NAME} {DRUG_DOSE}</b>\n"
-        msg += f"📅 {now}\n\n"
+        msg = f"🟢 <b>НАЙДЕНО: {DRUG_NAME} {DRUG_DOSE}!</b>\n📅 {now_str}\n\n"
         for r in in_stock:
-            msg += f"<b>{r['site']}</b>\n"
+            msg += f"📍 <b>{r['site']}</b>\n"
             msg += f"💊 {r['name']}\n"
             msg += f"💰 {r['price']}\n"
-            msg += f"🔗 <a href='{r['url']}'>Перейти</a>\n\n"
+            msg += f"🔗 <a href='{r['url']}'>Открыть страницу</a>\n\n"
         await send_telegram(msg)
     else:
-        # Если ничего не нашли — тихий лог (не спамим каждый день)
-        # Отправляем только краткое "не найдено" раз в день
-        msg = f"⚪ <b>{DRUG_NAME} {DRUG_DOSE}</b> — не найдено\n📅 {now}\n\n"
-        if not_found:
-            sites_checked = ", ".join(set(r["site"] for r in not_found))
-            msg += f"Проверено: {sites_checked}"
-        else:
-            msg += "Препарат не обнаружен ни на одном из сайтов."
+        # Группируем проверенные регионы для читаемого отчёта
+        regions_str = "\n".join(f"  • {s}" for s in checked) if checked else "  нет данных"
+        msg = (
+            f"⚪ <b>{DRUG_NAME} {DRUG_DOSE}</b> — не найдено\n"
+            f"📅 {now_str}\n\n"
+            f"Проверено {len(checked)} источников:\n{regions_str}"
+        )
         await send_telegram(msg)
-
-    print(f"\n{'='*55}")
-    print(f"  Найдено в наличии: {len(in_stock)}")
-    print(f"  Не в наличии: {len(not_found)}")
-    print(f"{'='*55}\n")
 
 
 if __name__ == "__main__":
